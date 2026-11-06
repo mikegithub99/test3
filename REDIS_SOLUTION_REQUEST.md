@@ -1,196 +1,205 @@
-# Redis Cleanup Architecture — Implementation and Verification Request
+# Greenfield Redis Heartbeat and Cleanup — Independent Architecture, Implementation, and Verification Challenge
 
 ## Mission
 
-Independently investigate, design, implement, and verify a correct and as-simple-as-possible Redis-based cleanup/heartbeat architecture for the server/job-status system in **`mikegithub99/test2`**.
+Design and build a Redis-based server heartbeat, job-status, and stale-server cleanup solution **from a blank starting point**.
 
-Do not treat the design notes below as unquestionable requirements or assume the current implementation is correct. They are a handoff of prior architectural reasoning and source inspection. Verify every important claim against the current repository, identify anything that has changed, and improve the design where justified.
+You are being given this problem statement, not an existing implementation. Your task is to exercise independent architectural judgment: discover the right abstractions, compare alternatives, design the data model and protocols, implement them, and demonstrate their behavior under concurrency and failure.
 
-**The objective is correctness with the minimum necessary coordination machinery.** Do not add leader election, quorum, distributed locks, fencing-token infrastructure, or other mechanisms merely because they are conventional. Equally, do not omit a mechanism if the actual safety requirements cannot be met without it.
+**Do not access, search for, request, or rely on the source code or implementation in `mikegithub99/test2` or any other pre-existing implementation of this project.** You do not have authorization to use that repository as a reference. Do not ask for access. Treat this as a greenfield design.
 
-This is an engineering assignment, not just a request for an architecture essay. Explore the repository, state the invariants, propose the best design, implement it, run meaningful tests, and deliver a reviewable Git branch/pull request with evidence. If a critical environmental limitation prevents implementation or testing, complete as much as possible and report the limitation precisely rather than claiming success.
+The working repository is `mikegithub99/test3`. It contains this assignment and some other project documentation. To preserve an unbiased first pass, **do not read `README.md`, `RedisArch.html`, or any other sibling design/architecture documents during Phase 1**. Work from this request alone. You may inspect those documents only in Phase 2, after you have committed your own initial architecture proposal and recorded your reasoning. Then critique the prior ideas rather than adopting them automatically.
+
+The goal is not to reproduce a predetermined design. It is to find the simplest architecture that satisfies the actual requirements. A design with leader election, quorum, leases, fencing tokens, or distributed locks is not automatically better; a design without them is not automatically better either. Justify every mechanism against a concrete safety or liveness requirement.
+
+This is an engineering assignment, not just an essay. Create the architecture, implement a working reference solution in this greenfield repository, add automated tests, run them, and report exactly what was and was not verified. Use a feature branch and a pull request; do not commit implementation work directly to the default branch.
 
 ---
 
-## 1. The problem to solve
+## Phase 1 — Independent design (do this before reading other project documents)
 
-The system maintains server registrations, heartbeats, jobs, and per-server/type summaries in Redis. A background cleanup manager scans for servers whose heartbeat has expired and removes their associated state and job records.
+Start by restating the problem in your own words and identifying missing requirements or ambiguities. Make reasonable explicit assumptions where needed, and distinguish assumptions from facts.
 
-The critical concurrency scenario is:
+### 1. System context
 
-1. Cleanup manager A acquires the cleanup scan lease.
-2. A pauses (for example, due to process suspension, long scheduling delay, or a network stall) long enough for its lease to expire.
-3. Cleanup manager B acquires the lease and begins scanning/cleaning.
-4. A resumes and continues executing work based on its earlier scan.
-5. A and B may now overlap, and a server may also be registering, refreshing its heartbeat, or changing job state.
+We need a service that tracks multiple server processes and the jobs associated with them using Redis.
 
-The real question is not necessarily how to guarantee that only one cleanup manager is ever active. It is:
+At a high level, the system needs to support:
 
-**How do we guarantee that stale or overlapping managers cannot successfully perform conflicting lifecycle or cleanup operations on the same server, while allowing harmless duplicate attempts and recoverable retries?**
+- Multiple server processes, each with a stable server identity.
+- Registration and liveness indication, normally through periodic heartbeats with an expiry/TTL.
+- Job creation and job-state changes associated with a server.
+- Queryable server/job status and useful summary/index data.
+- Background discovery and cleanup of servers that have genuinely become stale.
+- Multiple application instances may run the cleanup task concurrently.
+- Processes may pause for a long time and later resume.
+- Commands and network operations may be delayed, retried, or fail.
+- A process may crash at any point, including during cleanup.
+- Redis may be deployed standalone or as Redis Cluster; state the deployment model your first implementation supports and design the key layout accordingly.
 
-The design should distinguish scan coordination (an efficiency mechanism) from per-resource correctness (the safety mechanism).
+A representative race to analyze is:
 
-## 2. Repository and prior source-review handoff
+1. Cleanup worker A begins examining an apparently expired server.
+2. A pauses for longer than expected.
+3. Another cleanup worker B starts and examines the same server.
+4. The server process itself may resume and refresh its heartbeat or mutate job state.
+5. A, B, and the server process may now issue overlapping or delayed commands based on observations that are no longer current.
 
-The implementation to investigate is in **`mikegithub99/test2`**, primarily:
+We need to prevent stale observations and overlapping workers from corrupting state, deleting a live server's data, or applying destructive effects twice.
 
-- `2-colocated/RedisHeartbeatManager.cc`
-- `2-colocated/RedisHeartbeatManager.h`
-- `2-colocated/RedisJobScripts.inc`
-- `2-colocated/RedisJobStatus.cc`
-- `2-colocated/HeartbeatRunner.cc`
-- `2-colocated/HeartbeatRunner.h`
+### 2. Define the requirements and invariants
 
-Inspect related code, tests, build configuration, examples, key naming helpers, Redis client behavior, and all call sites as needed. Do not limit the review to these files.
+Before choosing mechanisms, write precise safety and liveness properties. At minimum consider:
 
-A previous source-level review (not a runtime verification) found the following. **Treat each item as a hypothesis to re-check against the current branch and exact Lua/C++ code:**
+**Safety**
+- A live server must not have its state or jobs deleted by cleanup.
+- Once a server incarnation has been terminally retired, delayed commands from that incarnation must not revive it or mutate its retired state.
+- Two cleanup workers may attempt the same work, but conflicting destructive effects must not both succeed.
+- Job records, indexes, memberships, and counters must remain mutually consistent.
+- Retries must not double-apply non-idempotent effects such as counter decrements.
+- Missing, malformed, or inconsistent data must not trigger unsafe best-effort deletion.
+- All multi-key atomic operations must respect the actual Redis transaction and Cluster hash-slot boundaries.
+- If server identities may be reused, stale commands from an earlier incarnation must not affect a later incarnation.
 
-- `RedisHeartbeatManager` starts a background cleanup thread.
-- Previously observed defaults were a 30-second heartbeat TTL, a 10-second heartbeat refresh interval, a 30-second cleanup lease TTL, a 5-second lease renewal interval, and a 5-second cleanup scan interval. Confirm current values and whether the relationships are safe.
-- A cleanup lease used a unique owner token and Redis `SET ... NX PX`; renewal and release compared the stored token before extending or deleting the lease.
-- The lease was not passed into the per-server cleanup scripts. Thus, lease expiry does not physically stop a paused former owner from resuming and issuing commands. Lease ownership alone must not be presented as the safety guarantee.
-- The cleanup path used per-server Lua scripts referred to in source as `kFenceExpiredServerScript` and `kCleanupExpiredServerScript`.
-- The fencing script appeared to atomically check heartbeat/state/registration information and transition an expired, previously live server from `ACTIVE` to `DELETING`.
-- The cleanup script appeared to require `DELETING` and an absent heartbeat, validate relevant records/counters before mutation, perform cleanup atomically, and recognize already-completed cleanup.
-- A terminal `DELETING` tombstone appeared to be retained to prevent an old server identity from becoming active again.
-- Lifecycle scripts appeared to reject writes unless the server state was `ACTIVE`; heartbeat refresh and fencing appeared to operate atomically in the same Redis Cluster hash slot.
-- The design appeared to rely on server IDs being unique and never reused, and on all lifecycle/destructive writes going through the guarded scripts.
-- The previous review concluded that the current per-server Lua guards might make a separate leader-election/quorum subsystem unnecessary for this single-resource cleanup problem. That conclusion has **not** been established by Redis runtime tests, formal verification, or exhaustive failure injection.
+**Liveness and recovery**
+- A genuinely dead server should eventually be detected and cleaned.
+- Temporary Redis/network failures should not permanently prevent cleanup.
+- A worker crash at any point must leave enough information for safe recovery/retry.
+- A healthy server should be able to continue operating despite cleanup-worker overlap or restart.
+- The system must define what happens when a cleanup worker loses coordination, pauses, or resumes late.
 
-Re-read the code and correct any inaccurate or outdated statements in this handoff.
+Identify which requirements are fundamental and which are policy choices (for example, how long to retain tombstones, whether job history is retained, or how quickly cleanup must occur).
 
-## 3. Required reasoning: start with invariants, not mechanisms
+### 3. Explore the design space independently
 
-Before changing code, define the system's safety and liveness requirements in precise, testable terms.
+Explore multiple plausible designs before selecting one. At minimum compare:
 
-At minimum, analyze these properties:
+- A simple TTL/lease-based cleanup approach.
+- Per-server atomic state transitions.
+- Per-server state transitions plus generation/epoch identifiers.
+- A global cleanup lease or leader-election approach.
+- A design in which cleanup workers can overlap safely without a global leader.
+- Any other design you believe is simpler or stronger.
 
-### Safety
+Do not just list these. Explain the exact execution order and failure behavior for each. Identify the smallest atomic unit needed to preserve correctness. Determine whether a single Redis Lua script, Redis transaction, compare-and-set operation, or a multi-phase protocol is appropriate.
 
-1. A server cannot successfully publish a heartbeat or perform an ordinary lifecycle/job mutation after its identity has irreversibly entered the terminal deleting state.
-2. A cleanup operation cannot delete state belonging to a live server.
-3. A stale cleanup manager cannot bypass the per-server state guard merely because it once held a scan lease.
-4. Two cleanup managers may attempt the same server, but they cannot both successfully perform conflicting destructive transitions.
-5. Job/type counters are not decremented twice, and cleanup does not silently corrupt indexes or summaries.
-6. Partial, malformed, missing, or inconsistent Redis data cannot cause unsafe destructive mutation.
-7. Redis Cluster routing and atomicity boundaries are correct for every multi-key Lua script.
-8. If identities can ever be reused, stale commands from an earlier incarnation cannot affect the new incarnation. If the design depends on IDs never being reused, make that a documented and enforced invariant rather than an implicit assumption.
+Challenge your own preferred design with counterexamples. For each mechanism you propose, answer:
 
-### Liveness and recovery
+> What concrete failure does this mechanism prevent, and why would the design be unsafe without it?
 
-1. A genuinely expired server can eventually be cleaned.
-2. A transient failure during cleanup can be retried safely.
-3. A crash before, during, or after cleanup does not leave permanent unrepairable state.
-4. A live server can continue normal operation when cleanup managers overlap or restart.
-5. Cleanup lease loss, renewal delay, manager pause, and Redis command failures have clearly defined behavior.
+Also consider Redis-specific failure assumptions: Lua atomicity, Cluster key slots, asynchronous replication, failover, persistence, acknowledged writes that may be lost, and what guarantees are impossible without stronger infrastructure.
 
-Explain which properties are guaranteed by Redis Lua atomicity, which depend on Redis persistence/failover configuration, which depend on application-wide discipline, and which cannot be guaranteed by the current architecture.
+### 4. Initial design deliverable — commit before proceeding
 
-## 4. Explicitly challenge the architecture
+Before writing implementation code, create and commit a design proposal in this repository. It must include:
 
-Compare at least these design choices:
+- State machine(s) and legal transitions.
+- Key schema, including representative concrete key names.
+- Redis data types and ownership of each key.
+- Atomic script/transaction boundaries and all keys touched by each operation.
+- Server identity/incarnation strategy.
+- Heartbeat and expiry semantics.
+- Cleanup protocol and retry/recovery behavior.
+- Job mutation rules and summary/index consistency.
+- Redis Cluster slot strategy and supported deployment assumptions.
+- Failure model, limitations, and rejected alternatives.
+- A table mapping every invariant to the mechanism that enforces it and the test that will validate it.
 
-- Per-server atomic lifecycle state machine with a terminal `DELETING` tombstone.
-- Lease-only cleanup ownership.
-- Lease plus a fencing/generation token checked by every affected operation.
-- Leader election or quorum-based coordination.
-- Per-resource compare-and-set / Lua transitions without global leader election.
-- Any simpler or stronger alternative you discover.
+Do not proceed to implementation until this initial proposal is committed. This preserves an inspectable record of your independent reasoning.
 
-Do not straw-man alternatives. Explain their costs, failure behavior, and the exact conditions under which each is warranted.
+---
 
-In particular, answer:
+## Phase 2 — Compare with prior project thinking
 
-- Is the cleanup lease needed for correctness, or only to reduce duplicate scanning and work?
-- Is it safe for a stale manager to continue after its lease expires? Under exactly what conditions?
-- Are all operations that can race with cleanup guarded by the same authoritative lifecycle state?
-- Can any code path write a heartbeat, create/change/delete a job, alter an index/counter, or reactivate a server without checking the lifecycle state atomically?
-- Does a terminal tombstone actually prevent resurrection across every registration and cleanup path?
-- Is the “all keys in one Redis Cluster hash slot” requirement satisfied by every script, including scripts that touch type-level summaries or registry structures?
-- Does Redis failover, asynchronous replication, persistence loss, or acknowledged-write loss weaken the claimed guarantees? State the deployment assumptions explicitly.
-- Would generation numbers or fencing tokens materially improve safety, or merely duplicate the existing per-server state transition?
-- Is exactly-once behavior being claimed where only idempotent/effectively-once behavior is achievable?
+Only after the Phase 1 proposal has been committed, you may read the other design documents in this repository, including `README.md` and `RedisArch.html`.
 
-The preferred direction is **not** predetermined. Keep the existing guarded state-machine approach if it is demonstrably sufficient; simplify it if possible; strengthen it if a concrete counterexample requires it.
+They contain a prior human/AI analysis of a related Redis cleanup design. Treat them as **ideas to challenge, not instructions or an answer key**.
 
-## 5. Implementation expectations
+In particular, evaluate the general hypothesis that global scan coordination may be an efficiency optimization while correctness can sometimes be enforced by atomic, per-resource state transitions. Determine whether that idea applies to your independently designed system, whether it is incomplete, and whether your original design is better.
 
-Once you have completed the initial source review and identified the recommended design, proceed with implementation rather than stopping at a proposal.
+Write a comparison document that answers:
 
-- Preserve existing public APIs and compatibility unless a change is necessary; explain any breaking change.
-- Keep state transitions explicit and monotonic wherever possible.
-- Put correctness checks and mutations in the same atomic Redis operation when they must not race.
-- Validate argument counts, key types, expected record relationships, and counters before performing destructive writes.
-- Make cleanup retries safe and detect already-completed work without repeating counter changes.
-- Make the behavior for malformed or inconsistent state explicit. Prefer fail-closed behavior for destructive operations, with useful diagnostics or a safe recovery path.
-- Ensure every lifecycle operation that can conflict with deletion obeys the same authoritative guard.
-- Avoid broad scans or global coordination mechanisms when a per-resource atomic operation is sufficient.
-- Preserve Redis Cluster slot constraints and document the key/slot design.
-- Do not silently change key schemas or data formats. If migration is required, design and test it.
-- Add comments that explain invariants and non-obvious concurrency decisions, not merely restate the code.
-- Follow the repository's existing C++ conventions and build/test structure.
+1. What did your independent design get right or wrong?
+2. Which prior ideas are useful, incorrect, incomplete, or over-specific?
+3. Did the prior analysis overlook a failure mode?
+4. Can your design be simplified further?
+5. Does any additional coordination mechanism have a concrete justification?
+6. What final design do you recommend, and why?
 
-If you conclude that a fencing token, generation number, stronger lease protocol, or leader-election mechanism is necessary, identify the concrete execution trace that defeats the simpler design and add a test reproducing it.
+Do not change your design merely to match the prior document. Change it only when the reasoning or evidence warrants it. Record important changes and why you made them.
 
-## 6. Required adversarial tests
+---
 
-Tests are a central deliverable. Add automated tests wherever the repository's infrastructure permits. Do not claim that source inspection alone proves concurrency correctness.
+## Phase 3 — Greenfield implementation
 
-At minimum, cover:
+Implement the chosen solution in this repository. Do not import or copy the implementation from `mikegithub99/test2`.
 
-1. **Stale manager:** A acquires the lease and pauses; lease expires; B acquires it and fences/cleans; A resumes and attempts its old work.
-2. **Heartbeat/fence race:** heartbeat refresh and expiry fencing execute concurrently. Exactly one legal outcome must result from their atomic ordering.
-3. **Job mutation/fence race:** job creation, transition, or completion races with the transition to `DELETING`.
-4. **Duplicate cleanup:** two managers attempt to fence and clean the same server.
-5. **Retry after partial workflow:** failures between fencing, reading job references, cleanup, and registry/index maintenance; retries must be safe.
-6. **Repeated cleanup:** a second cleanup attempt must not decrement counters or delete unrelated data again.
-7. **Never-live identity:** a server ID that was allocated but never successfully published its first heartbeat must not be incorrectly treated as an expired live server.
-8. **Tombstone/resurrection:** attempts to register, heartbeat, or mutate a server after deletion must fail.
-9. **Malformed data:** wrong Redis key types, missing referenced jobs, inconsistent membership/index counts, malformed script arguments, and invalid counters must fail safely.
-10. **Cluster routing:** exercise scripts against Redis Cluster (or a faithful integration environment) and verify all keys used by each script share the required slot.
-11. **Lease loss and renewal delay:** old owner continues running after lease expiry; verify that resource-level guards preserve safety.
-12. **Restart/recovery:** restart cleanup manager at different points in the lifecycle and verify eventual completion without double effects.
+If the repository has no suitable project structure or build system, create a small, self-contained reference implementation with clear setup instructions. Choose a practical language and Redis client, explain the choice, and keep the core protocol easy to inspect. Prefer a real Redis server for integration tests.
 
-Use real Redis integration tests for Lua semantics and concurrency where possible. Unit tests or mocks are useful but do not substitute for integration tests of scripts, Redis key types, atomic execution, and Cluster slot behavior. If Redis Cluster is unavailable, clearly label that coverage as untested and provide a reproducible test plan.
+The implementation should demonstrate, at minimum:
 
-For every test, state the invariant it protects. Include repeatable commands and required Redis setup.
+- Server registration and incarnation identity.
+- Heartbeat refresh and expiry.
+- Job creation and state transitions.
+- Server liveness and job-status queries.
+- Safe stale-server detection and cleanup.
+- Idempotent/retry-safe cleanup.
+- Safe behavior under concurrent cleanup workers.
+- Rejection of delayed writes from retired server incarnations.
+- Correct handling of indexes and summary counters if you choose to maintain them.
 
-## 7. Verification and engineering quality
+Keep the implementation focused. Do not build a large framework or add dependencies without a clear need. Document every important invariant next to the operation that enforces it.
 
-- Build the affected targets using the repository's documented toolchain.
-- Run the relevant existing tests as well as new tests.
-- Run static analysis, sanitizers, or formatting checks if already supported and practical.
-- Inspect the final diff for accidental changes, API breakage, key-schema changes, and untested paths.
-- Do not claim a build, test, sanitizer, or Redis Cluster run unless it actually completed successfully.
-- Distinguish clearly between tests run, tests not run, and tests that require external infrastructure.
-- If a test exposes a defect, fix it and rerun the relevant suite.
-- If a property cannot be proved or tested, describe the remaining uncertainty honestly.
+---
 
-## 8. Deliverables
+## Phase 4 — Adversarial verification
 
-Produce all of the following:
+Automated tests are a primary deliverable, not an optional follow-up. Use real Redis integration tests for Lua/transaction semantics and concurrency wherever practical.
 
-1. **Architecture decision record** describing the chosen design, invariants, alternatives rejected, assumptions, Redis Cluster slot strategy, and failure model.
-2. **Implementation** in `mikegithub99/test2`, with focused changes and appropriate tests.
-3. **Test report** with exact commands, environment, results, and limitations.
-4. **Failure-scenario table** showing each important scenario, expected behavior, and test coverage.
-5. **Git branch and pull request** for review. Do not push unreviewed changes directly to the default branch.
-6. A concise summary of what changed, why it is correct, what remains unverified, and how to reproduce the tests.
+At minimum test:
 
-Put the architecture decision record and test report in the repository in sensible locations. Link them from the pull request description.
+1. **Stale cleanup worker:** worker A observes a candidate and pauses; its coordination expires or another worker proceeds; A resumes and attempts stale work.
+2. **Heartbeat versus expiry:** heartbeat refresh races with cleanup fencing. The atomic ordering must produce a legal outcome without deleting a live incarnation.
+3. **Job mutation versus retirement:** job creation, transition, and completion race with server retirement.
+4. **Two cleanup workers:** both attempt the same server; cleanup effects and counters occur at most once.
+5. **Crash/retry:** simulate failures before and after each cleanup phase, then restart and retry.
+6. **Repeated cleanup:** repeated requests do not double-decrement counters or damage unrelated records.
+7. **Never-registered identity:** an identity that never became live is not incorrectly treated as a previously live expired server.
+8. **Retired identity:** delayed registration, heartbeat, and job mutations from the old incarnation are rejected.
+9. **Identifier reuse:** if reuse is supported, prove that old-incarnation commands cannot affect the new incarnation; otherwise test and document rejection of reuse.
+10. **Malformed data:** wrong Redis types, missing references, inconsistent indexes/counters, and invalid arguments fail safely.
+11. **Redis Cluster:** verify key-slot compatibility for every multi-key script if Cluster is claimed as supported. If not supported in the first version, say so explicitly and do not imply compatibility.
+12. **Manager restart and overlap:** demonstrate eventual cleanup and safety after worker restart, long pause, and lease/coordination loss if a lease is used.
 
-## 9. Decision standard
+For every test, state the invariant it protects. Include exact commands, Redis setup, and expected results. Separate unit tests from Redis integration tests. Do not substitute mocks for tests of Redis atomic execution.
 
-A successful result is not the most elaborate distributed architecture. It is the **simplest design that satisfies explicitly stated safety and liveness requirements under clearly stated Redis and application assumptions**.
+---
 
-Use this principle as the central test of every proposed mechanism:
+## Phase 5 — Build, review, and delivery
 
-> Coordinate scans for efficiency; enforce correctness at the resource.
+- Build the project and run all relevant tests.
+- Run formatting/static analysis where practical and supported.
+- Inspect the final diff for accidental changes and untested behavior.
+- Do not claim a test or build ran unless it actually completed successfully.
+- Clearly list tests not run and infrastructure unavailable.
+- If a failure is found, fix it and rerun the relevant tests.
+- State the exact Redis version and deployment assumptions used for verification.
 
-And use this question to challenge every additional layer of coordination:
+### Required deliverables
 
-> What concrete failure does this mechanism prevent that the existing atomic per-resource state transition does not already prevent?
+1. Initial independent architecture proposal, committed before reading the prior design documents.
+2. Independent-versus-prior-design comparison and final architecture decision record.
+3. Greenfield working implementation.
+4. Automated unit and Redis integration tests.
+5. Test report with exact commands, environment, outcomes, and limitations.
+6. Failure-scenario matrix mapping scenarios to expected behavior and test coverage.
+7. A feature branch and pull request for review; do not push implementation directly to the default branch.
+8. A concise final summary with links to the branch/PR and documents, what is proven, what remains uncertain, and how to reproduce the results.
 
-If there is no precise answer supported by an execution trace or test, do not add the mechanism.
+## Decision standard
 
-Do not optimize for agreeing with the previous analysis. Independently verify it, find counterexamples if they exist, and deliver a better solution if the evidence supports one.
+The winning design is not the one with the most distributed-systems terminology or infrastructure. It is the smallest design that meets the stated invariants under an explicit failure model.
+
+Be creative. Challenge the premise. Consider alternatives that are not listed. It is acceptable—and desirable—to conclude that a global cleanup lease is unnecessary, that a generation token is essential, or that the problem requires stronger coordination. What matters is a concrete argument and reproducible evidence.
+
+**Do not optimize for agreeing with the prior analysis. First solve the problem independently; only then compare your answer with the prior work.**
