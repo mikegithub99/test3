@@ -336,27 +336,67 @@ return RESULT_OK
 // Type metadata, server metadata, registeredAt, and ACTIVE are committed by
 // one execution so a crash cannot leave these per-type registration steps split.
 const char* const kRegisterAndActivateServerScript = R"lua(
-local manifest, typeSummary, serverSummary, state, ids = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
-local function valid(key, expected) local t = redis.call("TYPE", key).ok; return t == "none" or t == expected end
-if not valid(manifest, "hash") or not valid(typeSummary, "hash") or not valid(serverSummary, "hash") or not valid(state, "hash") or not valid(ids, "set") then return redis.error_reply("wrong per-type registration key type") end
-local serverType, serverId = ARGV[1], ARGV[2]
-local typeCount = tonumber(ARGV[4])
-if not typeCount or typeCount < 0 or typeCount ~= math.floor(typeCount) then return redis.error_reply("invalid type metadata count") end
-local serverCountIndex = 5 + typeCount * 2
-if serverCountIndex > #ARGV then return redis.error_reply("truncated type metadata") end
+local typeSummaryKey = KEYS[1]
+local serverSummaryKey = KEYS[2]
+local stateKey = KEYS[3]
+
+local function validHashOrNone(key)
+  local t = redis.call('TYPE', key).ok
+  return t == 'none' or t == 'hash'
+end
+
+if not validHashOrNone(typeSummaryKey) or
+   not validHashOrNone(serverSummaryKey) or
+   not validHashOrNone(stateKey) then
+  return redis.error_reply('wrong registration key type')
+end
+
+-- ARGV: serverId, type-createdAt, type metadata count/pairs,
+--       server metadata count/pairs.
+local typeCount = tonumber(ARGV[3])
+if not typeCount or typeCount < 0 or typeCount ~= math.floor(typeCount) then
+  return redis.error_reply('invalid server-type metadata count')
+end
+local serverCountIndex = 4 + typeCount * 2
+if serverCountIndex > #ARGV then
+  return redis.error_reply('truncated server-type metadata arguments')
+end
 local serverCount = tonumber(ARGV[serverCountIndex])
-if not serverCount or serverCount < 0 or serverCount ~= math.floor(serverCount) or #ARGV ~= serverCountIndex + serverCount * 2 then return redis.error_reply("invalid server metadata count") end
-if redis.call("HGET", state, serverId) then return 0 end
-local storedType = redis.call("HGET", manifest, "serverType")
-if storedType and storedType ~= serverType then return redis.error_reply("manifest serverType mismatch") end
-local now = redis.call("TIME"); local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-redis.call("HSETNX", manifest, "serverType", serverType); redis.call("HSETNX", manifest, "createdAt", ARGV[3]); redis.call("HSETNX", manifest, "lifecycle", "ACTIVE"); redis.call("HSETNX", manifest, "schemaVersion", "1")
-redis.call("HSETNX", typeSummary, "meta:createdAt", ARGV[3]); redis.call("HSETNX", typeSummary, "meta:createdByServerId", serverId)
-local cursor = 5
-for i=1,typeCount do redis.call("HSET", typeSummary, "meta:"..ARGV[cursor], ARGV[cursor+1]); cursor = cursor + 2 end
+if not serverCount or serverCount < 0 or
+   serverCount ~= math.floor(serverCount) or
+   #ARGV ~= serverCountIndex + serverCount * 2 then
+  return redis.error_reply('invalid server metadata arguments')
+end
+
+-- Do not write metadata or activate an identity that already has state,
+-- including a DELETING retirement tombstone.
+local serverId = ARGV[1]
+if redis.call('HGET', stateKey, serverId) ~= false then
+  return 0
+end
+
+-- Generate the activation timestamp before the first write. Redis TIME keeps
+-- this timestamp in the same clock domain as the other lifecycle timestamps.
+local now = redis.call('TIME')
+local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+redis.call('HSETNX', typeSummaryKey, 'meta:createdAt', ARGV[2])
+redis.call('HSETNX', typeSummaryKey, 'meta:createdByServerId', serverId)
+
+local cursor = 4
+for i = 1, typeCount do
+  redis.call('HSET', typeSummaryKey, 'meta:' .. ARGV[cursor], ARGV[cursor + 1])
+  cursor = cursor + 2
+end
+
 cursor = serverCountIndex + 1
-for i=1,serverCount do redis.call("HSET", serverSummary, "meta:"..ARGV[cursor], ARGV[cursor+1]); cursor = cursor + 2 end
-redis.call("HSETNX", serverSummary, "meta:registeredAt", tostring(nowMs)); redis.call("HSET", state, serverId, "ACTIVE"); redis.call("SADD", ids, serverId)
+for i = 1, serverCount do
+  redis.call('HSET', serverSummaryKey, 'meta:' .. ARGV[cursor], ARGV[cursor + 1])
+  cursor = cursor + 2
+end
+
+redis.call('HSETNX', serverSummaryKey, 'meta:registeredAt', tostring(nowMs))
+redis.call('HSET', stateKey, serverId, 'ACTIVE')
 return 1
 )lua";
 
@@ -773,6 +813,7 @@ local serverJobs = KEYS[3]
 local serverSummary = KEYS[4]
 local live = KEYS[5]
 local retired = KEYS[6]
+local ids = KEYS[7]
 local serverId = ARGV[1]
 local retentionMs = tonumber(ARGV[2])
 if not retentionMs or retentionMs < 0 then
@@ -781,13 +822,13 @@ end
 local function keytype(key)
   return redis.call('TYPE', key).ok
 end
-local st, ht, jt, mt, lt, rt =
+local st, ht, jt, mt, lt, rt, it =
   keytype(state), keytype(heartbeat), keytype(serverJobs),
-  keytype(serverSummary), keytype(live), keytype(retired)
+  keytype(serverSummary), keytype(live), keytype(retired), keytype(ids)
 if st ~= 'hash' or (ht ~= 'none' and ht ~= 'string') or
    (jt ~= 'none' and jt ~= 'set') or
    (mt ~= 'none' and mt ~= 'hash') or
-   (lt ~= 'none' and lt ~= 'set') or rt ~= 'zset' then
+   (lt ~= 'none' and lt ~= 'set') or rt ~= 'zset' or (it ~= 'none' and it ~= 'set') then
   return redis.error_reply('inconsistent retired-server cleanup key type')
 end
 if redis.call('HGET', state, serverId) ~= 'DELETING' then return 0 end
@@ -804,5 +845,6 @@ if redis.call('EXISTS', heartbeat) ~= 0 or
 end
 redis.call('HDEL', state, serverId, 'registeredAt:' .. serverId)
 redis.call('ZREM', retired, serverId)
+redis.call('SREM', ids, serverId)
 return 1
 )lua";
