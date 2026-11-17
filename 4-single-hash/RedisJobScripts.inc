@@ -400,42 +400,6 @@ redis.call('HSET', stateKey, serverId, 'ACTIVE')
 return 1
 )lua";
 
-const char* const kRegisterServerScript = R"lua(
-local serverTypesKey = KEYS[1]
-local currentTypeKey = KEYS[2]
-
-local function validtype(key)
-  local t = redis.call('TYPE', key).ok
-  return t == 'none' or t == 'set'
-end
-
-local serverType = ARGV[1]
-local serverId = ARGV[2]
-
--- Both registry keys are supplied explicitly and share the {registry} hash
--- tag. The type-prefixed server ID is unique across types, so only the
--- current type's registry set needs a duplicate-membership check.
-if not validtype(serverTypesKey) then
-  return redis.error_reply('wrong server-types key type')
-end
-if currentTypeKey ~= 'servers:{registry}:type:' .. serverType then
-  return redis.error_reply('current server registry key does not match server type')
-end
-if not validtype(currentTypeKey) then
-  return redis.error_reply('wrong current server registry key type')
-end
-if redis.call('SISMEMBER', currentTypeKey, serverId) == 1 then
-  return 0
-end
-
-redis.call('SADD', serverTypesKey, serverType)
-redis.call('SADD', currentTypeKey, serverId)
-return 1
-)lua";
-
-
-
-// Heartbeat refresh and live-set publication are one atomic per-type action.
 const char* const kRefreshHeartbeatScript = R"lua(
 local heartbeatKey = KEYS[1]
 local liveKey = KEYS[2]
@@ -734,32 +698,6 @@ return out
 )lua";
 
 // Registry-slot distributed cleanup scan lease scripts.
-const char* const kAcquireCleanupLeaseScript = R"lua(
-local key = KEYS[1]
-local t = redis.call('TYPE', key).ok
-if t ~= 'none' and t ~= 'string' then
-  return redis.error_reply('cleanup lease key has wrong type')
-end
-local result = redis.call('SET', key, ARGV[1], 'NX', 'PX', ARGV[2])
-if result then return 1 end
-return 0
-)lua";
-
-const char* const kRenewCleanupLeaseScript = R"lua(
-local key = KEYS[1]
-if redis.call('GET', key) ~= ARGV[1] then return 0 end
-return redis.call('PEXPIRE', key, ARGV[2])
-)lua";
-
-const char* const kReleaseCleanupLeaseScript = R"lua(
-local key = KEYS[1]
-if redis.call('GET', key) ~= ARGV[1] then return 0 end
-return redis.call('DEL', key)
-)lua";
-
-
-// Backfill tombstones created before the retired sorted set was deployed.
-// HSCAN is incremental; ZADD NX preserves any existing original retirement time.
 const char* const kIndexUntrackedTombstonesScript = R"lua(
 local state = KEYS[1]
 local retired = KEYS[2]
