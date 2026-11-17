@@ -120,3 +120,21 @@ Requires C++17, Redis++, the host `get_reg_val` implementation, and the platform
 Test registration retries and multi-server registration; same-slot KEYS for every Lua script; create/transition/complete across servers; counter invariant and int64 boundaries; wrong-type keys and malformed indexes; heartbeat/fence races; idempotent cleanup and tombstone retention; cluster-wide scan during concurrent creation, failover, and resharding; coherent per-type snapshots and pagination under mutation.
 
 See [SINGLE_HASHSLOT.md](SINGLE_HASHSLOT.md) for the full architecture proposal and detailed consistency analysis.
+
+
+## Administrative utilities and interactive browser
+
+The `util/` directory contains:
+
+- `RedisStatusCli.cc`: standalone SCAN-based keyspace inspector. Set `REDIS_URL`, optionally `REDIS_PATTERN` and `REDIS_SCAN_COUNT`. In Redis Cluster, run it against each primary endpoint when a complete cluster inventory is required; a node-local SCAN is not a cluster-wide inventory.
+- `RedisJobStatusCleanup.cc`: dry-run key lister for the single-slot namespace. It recognizes per-type manifests, summaries, server hashes, ID/state indexes, heartbeats, job indexes, job hashes, live sets, and retired tombstones. It deletes only after `--delete` and interactive `DELETE` confirmation. Use a standalone Redis endpoint or run per primary; do not assume a single-node scan covers the whole cluster.
+
+The `browser/` directory contains `redis_browser.py`, a Textual terminal UI. It discovers types by scanning `servers:*:manifest`, validates each manifest's `serverType`, and reads the per-type summary, ID set, server/state/heartbeat records, and server job indexes. It supports metadata/job inspection and administrative deletion. Type deletion cleans indexed servers and jobs, then marks the durable manifest `RETIRED`; it intentionally retains the manifest and server tombstones for discovery and ID-reuse safety.
+
+Browser dependencies: Python 3.10+, `redis` (redis-py), `textual`, and `rich`. Configure `REDIS_URL`; set `REDIS_CLUSTER=1` to use redis-py's `RedisCluster` client. Run with:
+
+```sh
+python3 browser/redis_browser.py
+```
+
+Build the C++ utilities with C++17 and Redis++ using the same include/link configuration as the service. The cleanup utility is destructive only after both explicit command-line opt-in and interactive confirmation.
