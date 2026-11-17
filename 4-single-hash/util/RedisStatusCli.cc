@@ -14,7 +14,6 @@
 
 #include <cstdlib>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,7 +25,6 @@ using std::pair;
 using std::string;
 using std::vector;
 using sw::redis::Redis;
-using sw::redis::RedisCluster;
 
 namespace
 {
@@ -106,12 +104,9 @@ int main()
     const string redisUrl = environmentValue(
         "REDIS_URL", "redis://127.0.0.1:6379");
     const string pattern = environmentValue("REDIS_PATTERN", "*");
-    const bool cluster = environmentValue("REDIS_CLUSTER", "false") == "true" ||
-                         environmentValue("REDIS_CLUSTER", "0") == "1";
-    std::unique_ptr<Redis> standalone;
-    std::unique_ptr<RedisCluster> clustered;
-    if (cluster) clustered = std::make_unique<RedisCluster>(RedisCluster::Options{redisUrl});
-    else standalone = std::make_unique<Redis>(redisUrl);
+    Redis redis(redisUrl);
+
+    long long cursor = 0;
     const long long count = scanCount();
     size_t keyCount = 0;
 
@@ -119,17 +114,26 @@ int main()
          << "URL: " << redisUrl << '\n'
          << "Pattern: " << pattern << '\n';
 
-    auto inspect = [&](auto& client) {
-      for (const auto& key : client.scan_iter(pattern, count)) {
-        try { printKey(client, key); ++keyCount; }
-        catch (const sw::redis::Error& error) {
+    do
+    {
+      vector<string> keys;
+      cursor = redis.scan(cursor, pattern, count, std::back_inserter(keys));
+
+      for (const auto& key : keys)
+      {
+        try
+        {
+          printKey(redis, key);
+          ++keyCount;
+        }
+        catch (const sw::redis::Error& error)
+        {
           cerr << "\n[warning] Could not read key '" << key
                << "': " << error.what() << '\n';
         }
       }
-    };
-    if (clustered) inspect(*clustered);
-    else inspect(*standalone);
+    }
+    while (cursor != 0);
 
     cout << "\nFinished. Read " << keyCount << " keys.\n";
     return EXIT_SUCCESS;
