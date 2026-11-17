@@ -490,7 +490,7 @@ RedisJobStatus::getServerSummaries(const string& serverType)
   {
     vector<string> ids;
     redis.smembers(serverIdsKey(serverType), back_inserter(ids));
-    KeyList keys = {typeSummaryKey(serverType)}; // routing key when registry is empty
+    KeyList keys = {typeSummaryKey(serverType)}; // per-type routing key for an empty server-ID set
     ArgList args = ids;
     for (const auto& id : ids)
       keys.push_back(serverSummaryKey(serverType, id));
