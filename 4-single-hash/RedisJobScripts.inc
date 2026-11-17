@@ -319,7 +319,7 @@ return RESULT_OK
  * @brief Adds a server type to global discovery and an instance to that type.
  *
  * KEYS[1] is the global server-type set and KEYS[2] is the current type's
- * server-ID set. Both keys must use the {registry} Redis Cluster hash tag.
+ * The per-type manifest and ID set are created in the same {serverType} slot.
  * ARGV[1] is serverType and ARGV[2] is serverId.
  *
  * Returns 0 if the ID is already registered for this type, otherwise 1.
@@ -697,7 +697,7 @@ end
 return out
 )lua";
 
-// Registry-slot distributed cleanup scan lease scripts.
+// No global cleanup lease is required; per-type fencing makes overlapping scans safe.
 const char* const kIndexUntrackedTombstonesScript = R"lua(
 local state = KEYS[1]
 local retired = KEYS[2]
@@ -742,8 +742,7 @@ local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 return redis.call('ZRANGEBYSCORE', retired, '-inf', tostring(nowMs - retentionMs))
 )lua";
 
-// Phase C is per-type. The caller confirms registry absence separately because
-// registry and lifecycle keys occupy different Redis Cluster slots.
+// Tombstone collection is entirely per-type. The durable ID set is pruned only after retention.
 const char* const kCollectRetiredServerTombstoneScript = R"lua(
 local state = KEYS[1]
 local heartbeat = KEYS[2]
