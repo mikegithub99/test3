@@ -221,8 +221,7 @@ class RedisBrowser(App):
                 server_hash = self.client.hgetall(server_key)
                 server_counters = counter_values(server_hash)
                 server_metadata = format_metadata({k[5:]: v for k, v in server_hash.items() if k.startswith("meta:")})
-                state_key = f"servers:{{{server_type}}}:state"
-                lifecycle_state = self.client.hget(state_key, server_id) or "UNKNOWN"
+                        lifecycle_state = self.client.hget(state_key, server_id) or "UNKNOWN"
                 heartbeat_key = f"servers:{{{server_type}}}:heartbeat:{server_id}"
                 heartbeat_ttl = self.client.ttl(heartbeat_key)
                 if heartbeat_ttl == -2:
@@ -614,8 +613,8 @@ return 1
         if result not in (1, 2):
             raise RuntimeError(f"Delete server rejected (code {result}).")
 
-        # Registry is a different Cluster slot: Phase B must be separate.
-        self.client.srem(f"servers:{{{server_type}}}:ids", server_id)
+        # Keep the server ID in the per-type index until tombstone collection
+        # removes it after the configured retention interval.
 
     def _delete_server_type(self, server_type: str) -> None:
         """Fence and clean all indexed servers, then retain a retired manifest."""
