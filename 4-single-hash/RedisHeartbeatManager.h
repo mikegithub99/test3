@@ -26,8 +26,8 @@ class HeartbeatRunner;
  * Instance() creates one cleanup manager per process. HeartbeatStart() creates
  * one heartbeat publisher per process using RedisJobStatus::Instance().
  *
- * Cleanup ownership is coordinated through a Redis lease. Per-server Lua
- * fencing remains authoritative if cleanup scans overlap.
+ * Every type is discovered from its durable manifest. Cleanup mutations stay
+ * within that type's hash slot; per-server Lua fencing serializes overlapping scans.
  */
 class RedisHeartbeatManager final
 {
@@ -42,7 +42,9 @@ public:
   {
     std::int64_t heartbeatTtlSeconds = 30;
     std::int64_t heartbeatRefreshIntervalSeconds = 10;
+    // Retained for source compatibility; the single-slot design has no global lease.
     std::int64_t cleanupLeaseTtlMilliseconds = 30000;
+    // Retained for source compatibility; the single-slot design has no global lease.
     std::int64_t cleanupLeaseRenewIntervalSeconds = 5;
     std::int64_t cleanupScanIntervalSeconds = 5;
     // Maximum time allowed between registration and the first heartbeat.
@@ -80,8 +82,8 @@ public:
   /**
    * @brief Performs one distributed stale-worker cleanup scan.
    *
-   * The scan acquires the Redis cleanup lease, checks registered workers,
-   * fences expired workers, and removes their associated job data.
+   * The scan discovers per-type manifests, checks indexed workers, fences expired
+   * workers, and removes their associated job data within each type slot.
    */
   void scanOnce();
 
