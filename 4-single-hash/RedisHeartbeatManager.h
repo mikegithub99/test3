@@ -42,10 +42,6 @@ public:
   {
     std::int64_t heartbeatTtlSeconds = 30;
     std::int64_t heartbeatRefreshIntervalSeconds = 10;
-    // Retained for source compatibility; the single-slot design has no global lease.
-    std::int64_t cleanupLeaseTtlMilliseconds = 30000;
-    // Retained for source compatibility; the single-slot design has no global lease.
-    std::int64_t cleanupLeaseRenewIntervalSeconds = 5;
     std::int64_t cleanupScanIntervalSeconds = 5;
     // Maximum time allowed between registration and the first heartbeat.
     std::int64_t firstHeartbeatTimeoutSeconds = 60;
