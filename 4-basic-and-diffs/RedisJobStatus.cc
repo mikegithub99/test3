@@ -274,17 +274,6 @@ namespace
     * @param args Arguments supplied as ARGV.
     * @return Integer result returned by the script.
     */
-   template <typename Redis>
-   int64_t evalCounterResult(
-         Redis& redis,
-         const char* script,
-         const KeyList& keys,
-         const ArgList& args)
-   {
-      const string validatedScript = string(kCounterValidationPrelude) + script;
-      return evalResult(redis, validatedScript, keys, args);
-   }
-
 
    /** @brief Parses the redisJobStatusEnabled configuration value as a boolean.
     * @param value Input value to parse or convert.
@@ -405,25 +394,6 @@ namespace
       throw invalid_argument("RedisJobStatus: unknown state");
    }
 
-   void validateIdentifier(
-         const string& value,
-         const char* name,
-         bool isServerType = false)
-   {
-      if (value.empty())
-      {
-         throw invalid_argument(
-               string("RedisJobStatus: ") + name + " must not be empty");
-      }
-      if (isServerType &&
-            (value.find('{') != string::npos ||
-               value.find('}') != string::npos))
-      {
-         throw invalid_argument(
-               "RedisJobStatus: serverType must not contain '{' or '}'");
-      }
-   }
-
 } // namespace
 
 RedisJobStatus::RedisJobStatus(ConfigProvider provider)
@@ -445,13 +415,6 @@ std::shared_ptr<RedisJobStatus> RedisJobStatus::Instance(ConfigProvider provider
    return instance;
 }
 
-void RedisJobStatus::validateLifecycleIdentity(const string& jobId) const
-{
-   validateIdentifier(m_serverType, "serverType", true);
-   validateIdentifier(m_serverId, "serverId");
-   validateIdentifier(jobId, "jobId");
-}
-
 RedisJobStatus::Result RedisJobStatus::createPendingJob(
       const string& jobId,
       const map<string, string>& metadata)
@@ -459,14 +422,6 @@ RedisJobStatus::Result RedisJobStatus::createPendingJob(
    if (!m_enabled)
    {
       return Result::Disabled;
-   }
-   validateLifecycleIdentity(jobId);
-   for (const auto& item : metadata)
-   {
-      if (item.first.empty())
-      {
-         throw invalid_argument("RedisJobStatus: job metadata field must not be empty");
-      }
    }
 
    const string reference = jobReference(m_serverId, jobId);
@@ -478,7 +433,7 @@ RedisJobStatus::Result RedisJobStatus::createPendingJob(
    });
    const auto result = m_client->execute([&](auto& redis)
    {
-      return evalCounterResult(redis, kCreatePendingScript, keys, args);
+      return evalResultredis, kCreatePendingScript, keys, args);
    });
    return resultFromScript(result);
 }
@@ -492,17 +447,9 @@ RedisJobStatus::Result RedisJobStatus::transitionJob(
    {
       return Result::Disabled;
    }
-   validateLifecycleIdentity(jobId);
    if (newState == State::Pending)
    {
       return Result::InvalidTransition;
-   }
-   for (const auto& item : metadata)
-   {
-      if (item.first.empty())
-      {
-         throw invalid_argument("RedisJobStatus: job metadata field must not be empty");
-      }
    }
 
    const string reference = jobReference(m_serverId, jobId);
@@ -515,7 +462,7 @@ RedisJobStatus::Result RedisJobStatus::transitionJob(
    });
    const auto result = m_client->execute([&](auto& redis)
    {
-      return evalCounterResult(redis, kTransitionScript, keys, args);
+      return evalResultredis, kTransitionScript, keys, args);
    });
    return resultFromScript(result);
 }
@@ -526,13 +473,12 @@ RedisJobStatus::Result RedisJobStatus::completeJob(const string& jobId)
    {
       return Result::Disabled;
    }
-   validateLifecycleIdentity(jobId);
    const string reference = jobReference(m_serverId, jobId);
    const KeyList keys = lifecycleKeys(jobId, m_serverType, m_serverId);
    ArgList args = {jobId, m_serverType, m_serverId, reference};
    const auto result = m_client->execute([&](auto& redis)
    {
-      return evalCounterResult(redis, kCompleteScript, keys, args);
+      return evalResultredis, kCompleteScript, keys, args);
    });
    return resultFromScript(result);
 }
@@ -546,34 +492,8 @@ void RedisJobStatus::registerServer(
       return;
    }
 
-   validateIdentifier(m_serverType, "serverType", true);
-   validateIdentifier(m_serverId, "serverId");
-   validateRegistrationMetadata(serverTypeMetadata, serverMetadata);
    registerServerInRegistry();
    activateRegisteredServer(serverTypeMetadata, serverMetadata);
-}
-
-void RedisJobStatus::validateRegistrationMetadata(
-      const map<string, string>& serverTypeMetadata,
-      const map<string, string>& serverMetadata) const
-{
-   for (const auto& item : serverTypeMetadata)
-   {
-      if (item.first.empty() || isReservedServerTypeMetadataField(item.first))
-      {
-         throw invalid_argument(
-               "RedisJobStatus: empty or reserved server-type metadata field");
-      }
-   }
-
-   for (const auto& item : serverMetadata)
-   {
-      if (item.first.empty() || isReservedServerMetadataField(item.first))
-      {
-         throw invalid_argument(
-               "RedisJobStatus: empty or reserved server metadata field");
-      }
-   }
 }
 
 void RedisJobStatus::registerServerInRegistry() const
@@ -610,11 +530,6 @@ void RedisJobStatus::activateRegisteredServer(
    // Metadata and ACTIVE publication share the per-type Cluster slot.
    const auto now = std::time(nullptr);
    const std::tm* utc = std::gmtime(&now);
-   if (!utc)
-   {
-      throw runtime_error("RedisJobStatus: unable to generate metadata timestamp");
-   }
-
    std::ostringstream timestamp;
    timestamp << std::put_time(utc, "%Y-%m-%dT%H:%M:%SZ");
 
@@ -644,14 +559,6 @@ void RedisJobStatus::refreshHeartbeat(int64_t ttlSeconds)
    {
       return;
    }
-   validateIdentifier(m_serverType, "serverType", true);
-   validateIdentifier(m_serverId, "serverId");
-   if (ttlSeconds <= 0)
-   {
-      throw invalid_argument(
-            "RedisJobStatus: heartbeat TTL must be positive");
-   }
-
    const KeyList keys = {
          heartbeatKey(m_serverType, m_serverId),
          liveServersKey(m_serverType),

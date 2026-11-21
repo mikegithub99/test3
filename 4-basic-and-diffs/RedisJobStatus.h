@@ -177,10 +177,6 @@ class RedisJobStatus final
     * @param serverTypeMetadata Metadata merged into the server-type summary.
     * @param serverMetadata Metadata merged into this server's summary.
     */
-   void validateRegistrationMetadata(
-         const std::map<std::string, std::string>& serverTypeMetadata,
-         const std::map<std::string, std::string>& serverMetadata) const;
-
    /**
     * @brief Inserts the server into the global registry slot after checking its state.
     */
@@ -204,7 +200,6 @@ class RedisJobStatus final
     * @brief Validates the configured server identity and supplied job identifier.
     * @param jobId Application job identifier to validate.
     */
-   void validateLifecycleIdentity(const std::string& jobId) const;
    /** Indicates whether Redis-backed status reporting is enabled. */
    bool m_enabled = true;
    /**

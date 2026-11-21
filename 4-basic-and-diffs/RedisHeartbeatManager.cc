@@ -468,18 +468,6 @@ RedisHeartbeatManager::RedisHeartbeatManager(ConfigProvider provider)
    }
 
    m_config = provider ? provider() : Config{};
-   if (m_config.heartbeatTtlSeconds <= 0 ||
-         m_config.heartbeatRefreshIntervalSeconds <= 0 ||
-         m_config.cleanupLeaseTtlMilliseconds <= 0 ||
-         m_config.cleanupLeaseRenewIntervalSeconds <= 0 ||
-         m_config.cleanupScanIntervalSeconds <= 0 ||
-         m_config.firstHeartbeatTimeoutSeconds <= 0 ||
-         m_config.retiredTombstoneRetentionSeconds <= 0)
-   {
-      throw std::invalid_argument(
-            "RedisHeartbeatManager: all configured durations must be positive");
-   }
-
    m_client = RedisClient::Instance();
    m_enabled = true;
    m_cleanupThread = std::thread(&RedisHeartbeatManager::cleanupLoop, this);

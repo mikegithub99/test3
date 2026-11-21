@@ -26,16 +26,6 @@ HeartbeatRunner::HeartbeatRunner(
          m_heartbeatTtlSeconds(heartbeatTtlSeconds),
          m_heartbeatRefreshIntervalSeconds(heartbeatRefreshIntervalSeconds)
 {
-   if (!m_status)
-   {
-      throw std::invalid_argument("HeartbeatRunner requires a non-null RedisJobStatus");
-   }
-
-   if (m_heartbeatTtlSeconds <= 0 || m_heartbeatRefreshIntervalSeconds <= 0)
-   {
-      throw std::invalid_argument("HeartbeatRunner durations must be positive");
-   }
-
    m_thread = std::thread(&HeartbeatRunner::run, this);
 }
 
