@@ -559,12 +559,6 @@ void RedisJobStatus::refreshHeartbeat(int64_t ttlSeconds)
    {
       return;
    }
-   if (ttlSeconds <= 0)
-   {
-      throw invalid_argument(
-            "RedisJobStatus: heartbeat TTL must be positive");
-   }
-
    const KeyList keys = {
          heartbeatKey(m_serverType, m_serverId),
          liveServersKey(m_serverType),
