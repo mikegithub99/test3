@@ -8,24 +8,6 @@
  * commands, but runtime errors do not roll back writes already performed.
  */
 
-// Shared validation helpers prepended to counter-mutating scripts.
-const char* const kCounterValidationPrelude = R"lua(
-local function counterValid(key, field, delta, requirePositive)
-  local raw = redis.call('HGET', key, field) or '0'
-  if not string.match(raw, '^%d+$') then return false end
-  local digits = string.gsub(raw, '^0+', '')
-  if digits == '' then digits = '0' end
-  local maxValue = '9223372036854775807'
-  if #digits > #maxValue or
-     (#digits == #maxValue and digits > maxValue) then
-    return false
-  end
-  if requirePositive and digits == '0' then return false end
-  if delta == 1 and digits == maxValue then return false end
-  return true
-end
-)lua";
-
 
 
 /**
@@ -82,13 +64,6 @@ if redis.call('SISMEMBER', typeJobsKey, reference) == 1 or
 end
 -- Preflight every counter before the first mutation. HINCRBY then cannot fail
 -- because of malformed, negative, or overflowing counter values.
-if not counterValid(typeSummaryKey, 'pending', 1, false) or
-   not counterValid(typeSummaryKey, 'total', 1, false) or
-   not counterValid(serverSummaryKey, 'pending', 1, false) or
-   not counterValid(serverSummaryKey, 'total', 1, false) then
-  return RESULT_DATA_INCONSISTENT
-end
-
 local jobId = ARGV[1]
 local serverType = ARGV[2]
 local serverId = ARGV[3]
@@ -167,11 +142,6 @@ local serverId = ARGV[3]
 local newState = ARGV[4]
 local reference = ARGV[5]
 local metadataCount = tonumber(ARGV[6])
-if not metadataCount or metadataCount < 0 or
-   metadataCount ~= math.floor(metadataCount) or
-   #ARGV ~= 6 + metadataCount * 2 then
-  return RESULT_DATA_INCONSISTENT
-end
 if storedType ~= serverType or storedServer ~= serverId or not old then
   return RESULT_DATA_INCONSISTENT
 end
@@ -201,15 +171,6 @@ local allowed =
   (old == 'SUSPENDED' and newState == 'ACTIVE')
 if not allowed then
   return RESULT_INVALID_TRANSITION
-end
-
-if not counterValid(typeSummaryKey, oldCounter, -1, true) or
-   not counterValid(typeSummaryKey, newCounter, 1, false) or
-   not counterValid(typeSummaryKey, 'total', 0, true) or
-   not counterValid(serverSummaryKey, oldCounter, -1, true) or
-   not counterValid(serverSummaryKey, newCounter, 1, false) or
-   not counterValid(serverSummaryKey, 'total', 0, true) then
-  return RESULT_DATA_INCONSISTENT
 end
 
 redis.call('HSET', jobKey, 'status', newState)
@@ -282,13 +243,6 @@ local counter = string.lower(status)
 if status ~= 'PENDING' and status ~= 'ACTIVE' and status ~= 'SUSPENDED' then
   return RESULT_DATA_INCONSISTENT
 end
-if not counterValid(typeSummaryKey, counter, -1, true) or
-   not counterValid(typeSummaryKey, 'total', -1, true) or
-   not counterValid(serverSummaryKey, counter, -1, true) or
-   not counterValid(serverSummaryKey, 'total', -1, true) then
-  return RESULT_DATA_INCONSISTENT
-end
-
 redis.call('HINCRBY', typeSummaryKey, counter, -1)
 redis.call('HINCRBY', typeSummaryKey, 'total', -1)
 redis.call('HINCRBY', serverSummaryKey, counter, -1)
@@ -691,9 +645,6 @@ if t ~= 'none' and t ~= 'zset' then
   return redis.error_reply('wrong retired-server index type')
 end
 local retentionMs = tonumber(ARGV[1])
-if not retentionMs or retentionMs < 0 then
-  return redis.error_reply('invalid tombstone retention')
-end
 local now = redis.call('TIME')
 local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 return redis.call('ZRANGEBYSCORE', retired, '-inf', tostring(nowMs - retentionMs))
@@ -710,9 +661,6 @@ local live = KEYS[5]
 local retired = KEYS[6]
 local serverId = ARGV[1]
 local retentionMs = tonumber(ARGV[2])
-if not retentionMs or retentionMs < 0 then
-  return redis.error_reply('invalid tombstone retention')
-end
 local function keytype(key)
   return redis.call('TYPE', key).ok
 end
