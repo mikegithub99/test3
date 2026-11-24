@@ -404,7 +404,7 @@ namespace
       if (registrationResultFromScript(rawResult) == RegistrationResult::AlreadyPresent)
       {
          throw runtime_error(
-               "RedisJobStatus: serverId is already registered or still has a retirement tombstone");
+               "RedisJobStatus: serverId is already registered or still has a retirement marker");
       }
    }
 
