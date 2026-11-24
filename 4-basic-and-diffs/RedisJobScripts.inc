@@ -383,7 +383,7 @@ return 1
 
 
 // Stale-server fencing.
-// KEYS: heartbeat, state hash, server jobs, server summary, live set, retirementMarker index.
+// KEYS: heartbeat, state hash, server jobs, server summary, live set, retirement-marker index.
 // ARGV: server ID, first-heartbeat grace period in milliseconds.
 // Returns 0 if not eligible, 1 if fenced, 2 if fencing already completed.
 // ---------------------------------------------------------------------------
@@ -420,7 +420,7 @@ local function redisTimeMs()
 end
 
 if current == 'DELETING' then
-  -- Backfill older retirement markers if the retirementMarker index did not exist yet.
+  -- Backfill older retirement markers if the retirement-marker index did not exist yet.
   if not redis.call('ZSCORE', retirementMarker, ARGV[1]) then
     redis.call('ZADD', retirementMarker, tostring(redisTimeMs()), ARGV[1])
   end
@@ -610,7 +610,7 @@ return redis.call('DEL', key)
 )lua";
 
 
-// Indexes state-hash retirement markers in the retirementMarker sorted set. HSCAN is incremental;
+// Indexes state-hash retirement markers in the retirement-marker sorted set. HSCAN is incremental;
 // ZADD NX preserves the first recorded retirement timestamp.
 const char* const kIndexUntrackedRetirementMarkersScript = R"lua(
 local state = KEYS[1]
@@ -641,11 +641,11 @@ return result[1]
 )lua";
 
 // Lists retirement markers whose retention period has elapsed, using Redis TIME.
-const char* const kListExpiredServerRetirementMarkersScript = R"lua(
+const char* const kListExpiredRetirementMarkersScript = R"lua(
 local retirementMarker = KEYS[1]
 local t = redis.call('TYPE', retirementMarker).ok
 if t ~= 'none' and t ~= 'zset' then
-  return redis.error_reply('wrong retirementMarker-server index type')
+  return redis.error_reply('wrong retirement-marker index type')
 end
 local retentionMs = tonumber(ARGV[1])
 local now = redis.call('TIME')
@@ -655,7 +655,7 @@ return redis.call('ZRANGEBYSCORE', retirementMarker, '-inf', tostring(nowMs - re
 
 // Collects one expired retirement marker in the per-type slot. The caller checks
 // registry absence separately because registry and lifecycle keys use different slots.
-const char* const kCollectRetiredServerRetirementMarkerScript = R"lua(
+const char* const kCollectRetirementMarkerScript = R"lua(
 local state = KEYS[1]
 local heartbeat = KEYS[2]
 local serverJobs = KEYS[3]
@@ -674,7 +674,7 @@ if st ~= 'hash' or (ht ~= 'none' and ht ~= 'string') or
    (jt ~= 'none' and jt ~= 'set') or
    (mt ~= 'none' and mt ~= 'hash') or
    (lt ~= 'none' and lt ~= 'set') or rt ~= 'zset' then
-  return redis.error_reply('inconsistent retirementMarker-server cleanup key type')
+  return redis.error_reply('inconsistent retirement-marker cleanup key type')
 end
 if redis.call('HGET', state, serverId) ~= 'DELETING' then return 0 end
 local retirementMarkerAt = redis.call('ZSCORE', retirementMarker, serverId)
