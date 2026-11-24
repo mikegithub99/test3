@@ -291,7 +291,7 @@ if not serverCount or serverCount < 0 or
 end
 
 -- Do not write metadata or activate an identity that already has state,
--- including a DELETING retirement retirement marker.
+-- including a DELETING retirement tombstone.
 local serverId = ARGV[1]
 if redis.call('HGET', stateKey, serverId) ~= false then
   return 0
@@ -383,7 +383,7 @@ return 1
 
 
 // Stale-server fencing.
-// KEYS: heartbeat, state hash, server jobs, server summary, live set, retirement-marker index.
+// KEYS: heartbeat, state hash, server jobs, server summary, live set, retired index.
 // ARGV: server ID, first-heartbeat grace period in milliseconds.
 // Returns 0 if not eligible, 1 if fenced, 2 if fencing already completed.
 // ---------------------------------------------------------------------------
@@ -394,13 +394,13 @@ local state = KEYS[2]
 local serverJobs = KEYS[3]
 local serverSummary = KEYS[4]
 local live = KEYS[5]
-local retirementMarker = KEYS[6]
+local retired = KEYS[6]
 local ht = redis.call('TYPE', heartbeat).ok
 local st = redis.call('TYPE', state).ok
 local jt = redis.call('TYPE', serverJobs).ok
 local mt = redis.call('TYPE', serverSummary).ok
 local lt = redis.call('TYPE', live).ok
-local rt = redis.call('TYPE', retirementMarker).ok
+local rt = redis.call('TYPE', retired).ok
 
 if (ht ~= 'none' and ht ~= 'string') or
    (st ~= 'none' and st ~= 'hash') or
@@ -420,9 +420,9 @@ local function redisTimeMs()
 end
 
 if current == 'DELETING' then
-  -- Backfill older retirement markers if the retirement-marker index did not exist yet.
-  if not redis.call('ZSCORE', retirementMarker, ARGV[1]) then
-    redis.call('ZADD', retirementMarker, tostring(redisTimeMs()), ARGV[1])
+  -- Backfill older tombstones if the retired index did not exist yet.
+  if not redis.call('ZSCORE', retired, ARGV[1]) then
+    redis.call('ZADD', retired, tostring(redisTimeMs()), ARGV[1])
   end
   if jt == 'none' and mt == 'none' and
      redis.call('SISMEMBER', live, ARGV[1]) == 0 then return 2 end
@@ -444,7 +444,7 @@ if not hasHeartbeated then
   if redisTimeMs() - registeredAt < timeoutMs then return 0 end
 end
 redis.call('HSET', state, ARGV[1], 'DELETING')
-redis.call('ZADD', retirementMarker, tostring(redisTimeMs()), ARGV[1])
+redis.call('ZADD', retired, tostring(redisTimeMs()), ARGV[1])
 return 1
 )lua";
 
@@ -569,7 +569,7 @@ end
 redis.call('DEL', serverJobs)
 redis.call('DEL', serverSummary, heartbeat)
 redis.call('SREM', live, serverId)
--- Retain DELETING until Phase C; IDs may be reused after retirement marker collection.
+-- Retain DELETING until Phase C; IDs may be reused after tombstone collection.
 return 1
 )lua";
 
@@ -610,19 +610,19 @@ return redis.call('DEL', key)
 )lua";
 
 
-// Indexes state-hash retirement markers in the retirement-marker sorted set. HSCAN is incremental;
+// Indexes state-hash tombstones in the retired sorted set. HSCAN is incremental;
 // ZADD NX preserves the first recorded retirement timestamp.
-const char* const kIndexUntrackedRetirementMarkersScript = R"lua(
+const char* const kIndexUntrackedTombstonesScript = R"lua(
 local state = KEYS[1]
-local retirementMarker = KEYS[2]
-local st, rt = redis.call('TYPE', state).ok, redis.call('TYPE', retirementMarker).ok
+local retired = KEYS[2]
+local st, rt = redis.call('TYPE', state).ok, redis.call('TYPE', retired).ok
 if (st ~= 'none' and st ~= 'hash') or
    (rt ~= 'none' and rt ~= 'zset') then
-  return redis.error_reply('wrong legacy retirement marker index key type')
+  return redis.error_reply('wrong legacy tombstone index key type')
 end
 
 -- Phase C may have removed the last state field, causing Redis to delete the
--- now-empty hash. An absent state hash has no legacy retirement markers to backfill.
+-- now-empty hash. An absent state hash has no legacy tombstones to backfill.
 if st == 'none' then
   return '0'
 end
@@ -634,34 +634,34 @@ local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local fields = result[2]
 for i = 1, #fields, 2 do
   if fields[i + 1] == 'DELETING' then
-    redis.call('ZADD', retirementMarker, 'NX', tostring(nowMs), fields[i])
+    redis.call('ZADD', retired, 'NX', tostring(nowMs), fields[i])
   end
 end
 return result[1]
 )lua";
 
-// Lists retirement markers whose retention period has elapsed, using Redis TIME.
-const char* const kListExpiredRetirementMarkersScript = R"lua(
-local retirementMarker = KEYS[1]
-local t = redis.call('TYPE', retirementMarker).ok
+// Lists tombstones whose retention period has elapsed, using Redis TIME.
+const char* const kListExpiredServerTombstonesScript = R"lua(
+local retired = KEYS[1]
+local t = redis.call('TYPE', retired).ok
 if t ~= 'none' and t ~= 'zset' then
-  return redis.error_reply('wrong retirement-marker index type')
+  return redis.error_reply('wrong retired index type')
 end
 local retentionMs = tonumber(ARGV[1])
 local now = redis.call('TIME')
 local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-return redis.call('ZRANGEBYSCORE', retirementMarker, '-inf', tostring(nowMs - retentionMs))
+return redis.call('ZRANGEBYSCORE', retired, '-inf', tostring(nowMs - retentionMs))
 )lua";
 
-// Collects one expired retirement marker in the per-type slot. The caller checks
+// Collects one expired tombstone in the per-type slot. The caller checks
 // registry absence separately because registry and lifecycle keys use different slots.
-const char* const kCollectRetirementMarkerScript = R"lua(
+const char* const kCollectRetiredServerTombstoneScript = R"lua(
 local state = KEYS[1]
 local heartbeat = KEYS[2]
 local serverJobs = KEYS[3]
 local serverSummary = KEYS[4]
 local live = KEYS[5]
-local retirementMarker = KEYS[6]
+local retired = KEYS[6]
 local serverId = ARGV[1]
 local retentionMs = tonumber(ARGV[2])
 local function keytype(key)
@@ -669,19 +669,19 @@ local function keytype(key)
 end
 local st, ht, jt, mt, lt, rt =
   keytype(state), keytype(heartbeat), keytype(serverJobs),
-  keytype(serverSummary), keytype(live), keytype(retirementMarker)
+  keytype(serverSummary), keytype(live), keytype(retired)
 if st ~= 'hash' or (ht ~= 'none' and ht ~= 'string') or
    (jt ~= 'none' and jt ~= 'set') or
    (mt ~= 'none' and mt ~= 'hash') or
    (lt ~= 'none' and lt ~= 'set') or rt ~= 'zset' then
-  return redis.error_reply('inconsistent retirement-marker cleanup key type')
+  return redis.error_reply('inconsistent retired-server cleanup key type')
 end
 if redis.call('HGET', state, serverId) ~= 'DELETING' then return 0 end
-local retirementMarkerAt = redis.call('ZSCORE', retirementMarker, serverId)
-if not retirementMarkerAt then return 0 end
+local retiredAt = redis.call('ZSCORE', retired, serverId)
+if not retiredAt then return 0 end
 local now = redis.call('TIME')
 local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-if tonumber(retirementMarkerAt) > nowMs - retentionMs then return 0 end
+if tonumber(retiredAt) > nowMs - retentionMs then return 0 end
 if redis.call('EXISTS', heartbeat) ~= 0 or
    keytype(serverJobs) ~= 'none' or
    keytype(serverSummary) ~= 'none' or
@@ -689,6 +689,6 @@ if redis.call('EXISTS', heartbeat) ~= 0 or
   return 0
 end
 redis.call('HDEL', state, serverId, 'registeredAt:' .. serverId)
-redis.call('ZREM', retirementMarker, serverId)
+redis.call('ZREM', retired, serverId)
 return 1
 )lua";
