@@ -173,33 +173,10 @@ class RedisJobStatus final
 
  private:
    /**
-    * @brief Validates caller-supplied registration metadata.
-    * @param serverTypeMetadata Metadata merged into the server-type summary.
-    * @param serverMetadata Metadata merged into this server's summary.
-    */
-   /**
-    * @brief Inserts the server into the global registry slot after checking its state.
-    */
-   void registerServerInRegistry() const;
-
-   /**
-    * @brief Writes per-type metadata and activates the server in its type slot.
-    * @param serverTypeMetadata Metadata merged into the server-type summary.
-    * @param serverMetadata Metadata merged into this server's summary.
-    */
-   void activateRegisteredServer(
-         const std::map<std::string, std::string>& serverTypeMetadata,
-         const std::map<std::string, std::string>& serverMetadata) const;
-
-   /**
     * @brief Constructs the singleton using the first call's configuration provider.
     */
    explicit RedisJobStatus(ConfigProvider provider);
 
-   /**
-    * @brief Validates the configured server identity and supplied job identifier.
-    * @param jobId Application job identifier to validate.
-    */
    /** Indicates whether Redis-backed status reporting is enabled. */
    bool m_enabled = true;
    /**
