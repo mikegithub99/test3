@@ -383,6 +383,63 @@ namespace
       }
    }
 
+   void registerServerInRegistry(
+         RedisClient& client,
+         const string& serverType,
+         const string& serverId)
+   {
+      const auto rawResult = client.execute([&](auto& redis)
+      {
+         const auto existingState = redis.hget(serverStateKey(serverType), serverId);
+         if (existingState)
+         {
+            return int64_t{0};
+         }
+
+         const KeyList keys = {kServerTypesKey, serverRegistryKey(serverType)};
+         const ArgList args = {serverType, serverId};
+         return evalResult(redis, kRegisterServerScript, keys, args);
+      });
+
+      if (registrationResultFromScript(rawResult) == RegistrationResult::AlreadyPresent)
+      {
+         throw runtime_error(
+               "RedisJobStatus: serverId is already registered or still has a retirement tombstone");
+      }
+   }
+
+   void activateRegisteredServer(
+         RedisClient& client,
+         const string& serverType,
+         const string& serverId,
+         const map<string, string>& serverTypeMetadata,
+         const map<string, string>& serverMetadata)
+   {
+      const auto now = std::time(nullptr);
+      const std::tm* utc = std::gmtime(&now);
+      std::ostringstream timestamp;
+      timestamp << std::put_time(utc, "%Y-%m-%dT%H:%M:%SZ");
+
+      const KeyList keys = {
+            typeSummaryKey(serverType),
+            serverSummaryKey(serverType, serverId),
+            serverStateKey(serverType)};
+      ArgList args = {serverId, timestamp.str()};
+      appendMetadataArgs(args, serverTypeMetadata, [](const string&) { return true; });
+      appendMetadataArgs(args, serverMetadata, [](const string&) { return true; });
+
+      const auto rawResult = client.execute([&](auto& redis)
+      {
+         return evalResult(redis, kRegisterAndActivateServerScript, keys, args);
+      });
+
+      if (activationResultFromScript(rawResult) != ActivationResult::Activated)
+      {
+         throw runtime_error(
+               "RedisJobStatus: serverId already has a lifecycle state and cannot be registered");
+      }
+   }
+
    string stateName(RedisJobStatus::State state)
    {
       switch (state)
@@ -492,65 +549,9 @@ void RedisJobStatus::registerServer(
       return;
    }
 
-   registerServerInRegistry();
-   activateRegisteredServer(serverTypeMetadata, serverMetadata);
-}
-
-void RedisJobStatus::registerServerInRegistry() const
-{
-   // The registry and per-type state use different Cluster slots. Check the
-   // authoritative per-type state before inserting into the registry slot.
-   const auto rawResult = m_client->execute([&](auto& redis)
-   {
-      const auto existingState =
-            redis.hget(serverStateKey(m_serverType), m_serverId);
-
-      if (existingState)
-      {
-         return int64_t{0};
-      }
-
-      const KeyList keys = {kServerTypesKey, serverRegistryKey(m_serverType)};
-      const ArgList args = {m_serverType, m_serverId};
-      return evalResult(redis, kRegisterServerScript, keys, args);
-   });
-
-   if (registrationResultFromScript(rawResult) ==
-         RegistrationResult::AlreadyPresent)
-   {
-      throw runtime_error(
-            "RedisJobStatus: serverId is already registered or still has a retirement tombstone");
-   }
-}
-
-void RedisJobStatus::activateRegisteredServer(
-      const map<string, string>& serverTypeMetadata,
-      const map<string, string>& serverMetadata) const
-{
-   // Metadata and ACTIVE publication share the per-type Cluster slot.
-   const auto now = std::time(nullptr);
-   const std::tm* utc = std::gmtime(&now);
-   std::ostringstream timestamp;
-   timestamp << std::put_time(utc, "%Y-%m-%dT%H:%M:%SZ");
-
-   const KeyList keys = {
-         typeSummaryKey(m_serverType),
-         serverSummaryKey(m_serverType, m_serverId),
-         serverStateKey(m_serverType)};
-   ArgList args = {m_serverId, timestamp.str()};
-   appendMetadataArgs(args, serverTypeMetadata, [](const string&) { return true; });
-   appendMetadataArgs(args, serverMetadata, [](const string&) { return true; });
-
-   const auto rawResult = m_client->execute([&](auto& redis)
-   {
-      return evalResult(redis, kRegisterAndActivateServerScript, keys, args);
-   });
-
-   if (activationResultFromScript(rawResult) != ActivationResult::Activated)
-   {
-      throw runtime_error(
-            "RedisJobStatus: serverId already has a lifecycle state and cannot be registered");
-   }
+   registerServerInRegistry(*m_client, m_serverType, m_serverId);
+   activateRegisteredServer(
+         *m_client, m_serverType, m_serverId, serverTypeMetadata, serverMetadata);
 }
 
 void RedisJobStatus::refreshHeartbeat(int64_t ttlSeconds)
