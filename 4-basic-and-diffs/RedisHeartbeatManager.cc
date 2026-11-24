@@ -7,7 +7,7 @@
 
 #include "HeartbeatRunner.h"
 #include "RedisJobStatus.h"
-#include "RedisJobScripts.inc"
+#include "RedisHeartbeatScripts.inc"
 
 #include <iostream>
 #include <initializer_list>
