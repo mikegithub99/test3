@@ -36,7 +36,8 @@ string get_reg_val(const string& key);
 
 namespace
 {
-#include "RedisJobScripts.inc"
+#include "RedisJobStatusScripts.inc"
+#include "RedisHeartbeatScripts.inc"
 
 
    /** @brief Builds a collision-safe reference from a server ID and job ID.
