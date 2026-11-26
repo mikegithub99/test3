@@ -234,7 +234,7 @@ namespace
       std::size_t count = 0;
       for (const auto& item : metadata)
       {
-         if (!includeField(item.first))
+         if (item.first.empty() || !includeField(item.first))
          {
             continue;
          }
